@@ -31,6 +31,10 @@ cp "$ICON_OUT/Assets.car" "$ICON_OUT/AppIcon.icns" "$APP/Contents/Resources/"
 cp Resources/scripts/* "$APP/Contents/Resources/"
 chmod 755 "$APP/Contents/Resources/nuitblanche" "$APP/Contents/Resources/nuitblanche-watchdog"
 codesign --force --sign - --timestamp=none "$APP"
+# La copie de build/ ne doit jamais répondre aux URL nuitblanche:// à la place de l'app installée
+# (même identifiant) : on la retire de LaunchServices.
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+  -u "$PWD/$APP" 2>/dev/null || true
 echo "Application prête : $APP"
 
 if [ "${1:-}" = "--install" ]; then
@@ -41,9 +45,6 @@ if [ "${1:-}" = "--install" ]; then
   fi
   rm -rf "$DEST"
   cp -R "$APP" "$DEST"
-  # Une seule copie enregistrée pour le schéma nuitblanche:// (celle de ~/Applications).
-  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
-    -u "$PWD/$APP" 2>/dev/null || true
   touch "$DEST"
   open "$DEST"
   echo "Installée et lancée : $DEST"

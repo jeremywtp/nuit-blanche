@@ -38,9 +38,17 @@ warn() { printf '%s!%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
 die()  { printf '%s✗ %s%s\n' "$RED" "$*" "$RESET" >&2; exit 1; }
 note() { printf '  %s%s%s\n' "$DIM" "$*" "$RESET"; }
 
-cleanup() {
+FINISHED=0
+# Fichiers temporaires retirés dans tous les cas. Un arrêt imprévu (bash 3.2 sort alors avec le code 0)
+# est signalé comme un échec.
+on_exit() {
+  local status=$?
   if [ -n "$TMP" ]; then rm -rf "$TMP"; fi
   if [ -n "$STAGED" ]; then rm -rf "$STAGED"; fi
+  if [ "$status" = 0 ] && [ "$FINISHED" = 0 ]; then
+    printf '%s✗ Interruption inattendue. Relancez la commande.%s\n' "$RED" "$RESET" >&2
+    exit 1
+  fi
 }
 
 usage() {
@@ -168,10 +176,9 @@ install_app() { # tag forcer hooks
   fi
 
   TMP=$(mktemp -d "${TMPDIR:-/tmp}/nuitblanche.XXXXXX")
-  trap cleanup EXIT
   base="https://github.com/$REPO/releases/download/$tag"
 
-  step "Téléchargement de Nuit Blanche $version…"
+  step "Téléchargement de Nuit Blanche ${version}…"
   fetch "$base/$ASSET" "$TMP/$ASSET" || die "Version $version introuvable ($base/$ASSET)."
   fetch "$base/$ASSET.sha256" "$TMP/$ASSET.sha256" || die "Somme de contrôle introuvable pour la version $version."
 
@@ -198,7 +205,11 @@ install_app() { # tag forcer hooks
   # une app signée sans compte développeur Apple).
   xattr -dr com.apple.quarantine "$STAGED" 2>/dev/null || true
 
-  if [ -n "$current" ]; then step "Mise à jour de $(plist_value "$current" CFBundleShortVersionString) vers $version…"; fi
+  if [ -n "$current" ]; then
+    local previous
+    previous=$(plist_value "$current" CFBundleShortVersionString || true)
+    if [ "$previous" = "$version" ]; then step "Réinstallation de la version ${version}…"; else step "Mise à jour de ${previous:-?} vers ${version}…"; fi
+  fi
   stop_app
   rm -rf "$dest" || die "Ancienne version impossible à retirer ($dest). Relancez la commande."
   mv "$STAGED" "$dest" || die "Installation impossible dans $dest. Relancez la commande."
@@ -229,11 +240,22 @@ install_app() { # tag forcer hooks
   esac
 
   if [ "$fresh" = 1 ]; then
+    # Seulement ce qui reste à faire sur ce Mac.
+    local todo=()
+    [ -e "$SUDOERS" ] || todo+=("${BOLD}Capot fermé${RESET} : mot de passe administrateur une fois, pour travailler écran rabattu.")
+    if ! grep -qs "nuitblanche hook" "$HOME"/.claude*/settings.json "$HOME/.codex/hooks.json"; then
+      todo+=("${BOLD}Agents IA → Connecter${RESET} : maintien automatique pendant que Claude Code ou Codex travaillent.")
+    fi
     echo
-    echo "${BOLD}Dernières étapes, dans le panneau (lune de la barre des menus) :${RESET}"
-    echo "  1. ${BOLD}Capot fermé${RESET} : mot de passe administrateur une fois, pour travailler écran rabattu."
-    [ "$hooks" = 1 ] || echo "  2. ${BOLD}Agents IA → Connecter${RESET} : maintien automatique pendant que Claude Code ou Codex travaillent."
-    echo
+    if [ ${#todo[@]} -gt 0 ]; then
+      echo "${BOLD}Dernières étapes, dans le panneau (lune de la barre des menus) :${RESET}"
+      local n=1 item
+      for item in "${todo[@]}"; do
+        echo "  $n. $item"
+        n=$((n + 1))
+      done
+      echo
+    fi
     note "Mise à jour : relancez la même commande. Désinstallation : … | bash -s -- --uninstall"
   fi
 }
@@ -272,7 +294,7 @@ uninstall() {
   fi
 
   if [ -e "$SUDOERS" ]; then
-    step "Mot de passe administrateur demandé pour retirer la règle $SUDOERS…"
+    step "Mot de passe administrateur demandé pour retirer la règle ${SUDOERS}…"
     if /usr/bin/sudo /bin/rm -f "$SUDOERS"; then ok "Règle sudoers retirée."; else warn "À retirer à la main : sudo rm $SUDOERS"; fi
   fi
 
@@ -318,4 +340,6 @@ main() {
   if [ "$action" = uninstall ]; then uninstall; else install_app "$tag" "$force" "$hooks"; fi
 }
 
+trap on_exit EXIT
 main "$@"
+FINISHED=1
