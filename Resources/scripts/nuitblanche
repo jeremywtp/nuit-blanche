@@ -1,0 +1,181 @@
+#!/bin/bash
+# Nuit Blanche — commande Terminal et hook pour agents (Claude Code, Codex).
+#
+#   nuitblanche run -- <commande…>   garde le Mac éveillé le temps de la commande
+#   nuitblanche hold [durée]         garde le Mac éveillé (30m, 2h, 1h30, 90 ; sans durée : jusqu'à release)
+#   nuitblanche release              arrête les maintiens demandés depuis le Terminal et la caféine
+#   nuitblanche status [--json]      affiche l'état
+#   nuitblanche open [écran]         ouvre le panneau (main, awake, lid, agents, display, settings)
+#   nuitblanche hook <agent> <événement>   appelé par les hooks Claude Code / Codex (lit le JSON sur stdin)
+#
+# Les sessions sont des petits fichiers JSON lus par l'app toutes les 2 secondes.
+
+DIR="$HOME/Library/Application Support/NuitBlanche"
+SESS="$DIR/sessions"
+
+# Échappe pour JSON ; retire les caractères de contrôle (une tabulation dans un chemin rendait le JSON invalide).
+esc() { printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+# Première occurrence de la clé : les champs de premier niveau (session_id, cwd…) précèdent tool_input /
+# tool_response, qui peuvent contenir une clé du même nom (outil MCP, par exemple).
+json_get() { # $1 = clé ; lit $INPUT
+  printf '%s' "$INPUT" | tr -d '\n' | grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -n 1 \
+    | sed "s/^\"$1\"[[:space:]]*:[[:space:]]*\"//; s/\"\$//"
+}
+
+# PID du processus agent (claude / codex) parmi les ancêtres du hook.
+agent_pid() {
+  local p=$PPID i=0 c
+  while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ $i -lt 8 ]; do
+    c=$(ps -o comm= -p "$p" 2>/dev/null)
+    c=${c##*/}
+    case "$c" in
+      claude*|codex*) echo "$p"; return ;;
+    esac
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    i=$((i + 1))
+  done
+}
+
+write_session() { # fichier agent id état cwd pid until label [boot]
+  local f=$1 tmp="$1.$$.tmp"
+  mkdir -p "$SESS" 2>/dev/null
+  printf '{"agent":"%s","session":"%s","state":"%s","cwd":"%s","pid":%s,"ts":%s,"until":%s,"label":"%s","boot":"%s"}\n' \
+    "$2" "$(esc "$3")" "$4" "$(esc "$5")" "${6:-0}" "$(date +%s)" "${7:-0}" "$(esc "$8")" "$(esc "${9:-}")" > "$tmp" \
+    && mv -f "$tmp" "$f"
+}
+
+# Démarrage du Mac : un maintien Terminal ne survit pas à un redémarrage.
+# Identifiant du démarrage (ne bouge pas quand l'horloge est recalée, contrairement à l'heure de démarrage).
+boot_id() { sysctl -n kern.bootsessionuuid 2>/dev/null; }
+me_running() { pgrep -xq -U "$(id -u)" NuitBlanche; }
+
+cmd_hook() {
+  local agent=$1 event=$2 sid cwd f state pid msg agentpid
+  INPUT=""
+  if [ ! -t 0 ]; then IFS= read -r -t 3 -d '' INPUT 2>/dev/null || true; fi
+  [ -z "$event" ] && event=$(json_get hook_event_name)
+  sid=$(json_get session_id)
+  agentpid=""
+  if [ -z "$sid" ]; then
+    # Pas d’identifiant : clé stable = PID de l’agent (le PID du shell du hook change à chaque appel).
+    agentpid=$(agent_pid)
+    sid="pid-${agentpid:-unknown}"
+  fi
+  sid=$(printf '%s' "$sid" | tr -c 'A-Za-z0-9._-' '_')
+  cwd=$(json_get cwd)
+  [ -z "$cwd" ] && cwd="${CLAUDE_PROJECT_DIR:-$PWD}"
+  f="$SESS/$agent-$sid.json"
+
+  case "$event" in
+    SessionEnd) rm -f "$f"; return ;;
+    SessionStart) [ -f "$f" ] && return; state=idle ;;
+    UserPromptSubmit|PreToolUse|PostToolUse|PostToolUseFailure|SubagentStart) state=working ;;
+    # Stop ne part pas après une erreur d’API (StopFailure à la place) ; l’interruption par Échap n’envoie
+    # rien : l’app fait expirer les sessions muettes (Sessions.swift).
+    Stop|StopFailure) state=idle ;;
+    PermissionRequest) state=waiting ;;
+    Notification)
+      msg=$(json_get message)$(json_get notification_type)
+      case "$msg" in
+        *ermission*|*approv*|*autoris*) state=waiting ;;
+        # Claude attend une saisie : le tour est fini, même sans Stop (interruption par Échap, refus…).
+        *idle_prompt*|*"waiting for your input"*) state=idle ;;
+        *) return ;;
+      esac ;;
+    *) return ;;
+  esac
+
+  pid=""
+  [ -f "$f" ] && pid=$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$f")
+  # PID mémorisé mort (session reprise avec --resume, par exemple) : on recherche l'agent vivant.
+  if [ -n "$pid" ] && [ "$pid" != 0 ] && ! kill -0 "$pid" 2>/dev/null; then pid=""; fi
+  if [ -z "$pid" ] || [ "$pid" = 0 ]; then pid=${agentpid:-$(agent_pid)}; fi
+  write_session "$f" "$agent" "$sid" "$state" "$cwd" "${pid:-0}" 0 ""
+}
+
+parse_minutes() {
+  local s=$1 h=0 m=0
+  case "$s" in
+    *h*) h=${s%%h*}; m=${s#*h}; m=${m%m}; m=${m%min} ;;
+    *min) m=${s%min} ;;
+    *m) m=${s%m} ;;
+    *) m=$s ;;
+  esac
+  [ -z "$h" ] && h=0
+  [ -z "$m" ] && m=0
+  case "$h$m" in *[!0-9]*) return 1 ;; esac
+  echo $((10#$h * 60 + 10#$m))
+}
+
+ensure_app() {
+  me_running && return 0
+  open -g -a "Nuit Blanche" 2>/dev/null || open -g -b com.jeremywtp.NuitBlanche 2>/dev/null
+  sleep 2
+  me_running || echo "Attention : Nuit Blanche n'est pas lancée, ce maintien ne sera appliqué qu'à son ouverture." >&2
+}
+
+case "${1:-}" in
+  hook)
+    shift
+    cmd_hook "$@" >/dev/null 2>&1
+    exit 0
+    ;;
+  run)
+    shift
+    [ "${1:-}" = "--" ] && shift
+    [ $# -eq 0 ] && { echo "Usage : nuitblanche run -- <commande…>" >&2; exit 2; }
+    ensure_app
+    f="$SESS/cmd-$$.json"
+    write_session "$f" cmd "$$" hold "$PWD" "$$" 0 "$*" "$(boot_id)"
+    trap 'rm -f "$f"' EXIT INT TERM
+    "$@"
+    exit $?
+    ;;
+  hold)
+    ensure_app
+    until=0
+    label="Maintien Terminal"
+    if [ -n "${2:-}" ]; then
+      minutes=$(parse_minutes "$2") || { echo "Durée invalide : $2 (exemples : 30m, 2h, 1h30, 90)" >&2; exit 2; }
+      [ "$minutes" -gt 0 ] || { echo "Durée invalide : $2 (au moins 1 minute)" >&2; exit 2; }
+      until=$(( $(date +%s) + minutes * 60 ))
+      label="Maintien Terminal ($2)"
+    fi
+    write_session "$SESS/cli-hold.json" cli hold hold "$PWD" 0 "$until" "$label" "$(boot_id)"
+    if [ "$until" = 0 ]; then
+      echo "Le Mac reste éveillé jusqu'à « nuitblanche release »."
+    else
+      echo "Le Mac reste éveillé jusqu'à $(date -r "$until" +%H:%M)."
+    fi
+    ;;
+  release)
+    rm -f "$SESS"/cli-*.json
+    me_running && open -g "nuitblanche://release"
+    echo "Maintiens arrêtés : le Mac peut de nouveau se mettre en veille."
+    ;;
+  status)
+    if [ "${2:-}" = "--json" ]; then
+      # JSON seul (lisible par un agent) : pas de ligne de texte en plus.
+      if me_running && [ -f "$DIR/state.json" ]; then cat "$DIR/state.json"; else echo '{"running":false}'; fi
+      exit 0
+    fi
+    if me_running && [ -f "$DIR/state.txt" ]; then
+      cat "$DIR/state.txt"
+    else
+      echo "Nuit Blanche n'est pas lancée."
+    fi
+    printf 'pmset : SleepDisabled = %s\n' "$(/usr/bin/pmset -g | awk '/SleepDisabled/ {print $2}')"
+    ;;
+  open)
+    ensure_app
+    open -g "nuitblanche://panel/${2:-main}"
+    ;;
+  ""|-h|--help|help)
+    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *)
+    echo "Commande inconnue : $1 (voir nuitblanche help)" >&2
+    exit 2
+    ;;
+esac

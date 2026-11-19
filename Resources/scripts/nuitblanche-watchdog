@@ -1,0 +1,100 @@
+#!/bin/bash
+# Nuit Blanche — watchdog (LaunchAgent, toutes les 60 s et à l'ouverture de session).
+#
+# 1. L'app a planté (macOS a écrit un rapport de plantage depuis son dernier battement) → on la relance,
+#    pour que les agents continuent ; au plus 3 tentatives en 5 minutes (sinon boucle de plantage).
+#    « Forcer à quitter » ne laisse pas de rapport : la décision de l'utilisateur est respectée.
+# 2. L'app est figée (battement de plus de 3 minutes, constaté deux fois de suite, hors réveil récent
+#    du Mac) → on l'arrête, puis on la relance.
+# 3. Si elle ne revient pas et qu'elle avait désactivé la veille → on rétablit la veille, et on rendort
+#    le Mac s'il est fermé sans écran externe. Ne touche jamais un réglage pmset que l'app n'a pas posé.
+
+DIR="$HOME/Library/Application Support/NuitBlanche"
+MARK="$DIR/sleep-disabled-by-app"
+HEARTBEAT="$DIR/heartbeat"
+ATTEMPTS="$DIR/relaunch-attempts"
+SUSPECT="$DIR/freeze-suspect"
+FREEZES="$DIR/freeze-kills"
+REPORTS="$HOME/Library/Logs/DiagnosticReports"
+ME=$(id -u)
+running() { pgrep -xq -U "$ME" NuitBlanche; }   # seulement l'app de ce compte
+APP_ID="com.jeremywtp.NuitBlanche"
+
+relaunch() {
+  local now
+  now=$(date +%s)
+  [ "$(recent_count "$ATTEMPTS" 300)" -ge 3 ] && return 1
+  echo "$now" >> "$ATTEMPTS"
+  /usr/bin/open -g -b "$APP_ID" 2>/dev/null || return 1
+  sleep 5
+  running
+}
+
+# Nombre d'horodatages récents (moins de $2 secondes) dans le fichier $1, après nettoyage des anciens.
+recent_count() {
+  local now
+  now=$(date +%s)
+  if [ -f "$1" ]; then
+    awk -v limit=$((now - $2)) '$1 > limit' "$1" > "$1.tmp" 2>/dev/null && mv -f "$1.tmp" "$1"
+    wc -l < "$1" | tr -d ' '
+  else
+    echo 0
+  fi
+}
+
+frozen=0
+gave_up=0
+if running; then
+  last=$(stat -f %m "$HEARTBEAT" 2>/dev/null || echo 0)
+  age=$(( $(date +%s) - last ))
+  if [ "$age" -lt 180 ]; then rm -f "$SUSPECT"; exit 0; fi   # l'app répond : rien à faire
+  # Juste après un réveil du Mac, le battement n'a pas encore pu avancer : ce n'est pas un gel.
+  wake=$(sysctl -n kern.waketime 2>/dev/null | sed -n 's/.*sec = \([0-9]*\),.*/\1/p')
+  if [ "${wake:-0}" -gt 0 ] && [ $(( $(date +%s) - wake )) -lt 240 ]; then exit 0; fi
+  # Deux constats de suite (une minute d'écart) avant de déclarer l'app figée.
+  if [ ! -f "$SUSPECT" ]; then touch "$SUSPECT"; exit 0; fi
+  rm -f "$SUSPECT"
+  pkill -9 -x -U "$ME" NuitBlanche
+  sleep 2
+  # Gel à répétition (3 arrêts en 30 min) : on abandonne la relance.
+  if [ "$(recent_count "$FREEZES" 1800)" -ge 3 ]; then gave_up=1; else date +%s >> "$FREEZES"; frozen=1; fi
+fi
+rm -f "$SUSPECT"
+
+# Plantage : rapport de plantage plus récent que le dernier battement (un arrêt normal supprime le battement).
+crash_report() { find "$REPORTS" -maxdepth 1 -name 'NuitBlanche*.ips' -newer "$HEARTBEAT" 2>/dev/null | grep -q .; }
+crashed=0
+if [ "$gave_up" = 0 ] && [ -f "$HEARTBEAT" ] && ! running; then
+  if crash_report; then
+    crashed=1
+  elif [ $(( $(date +%s) - $(stat -f %m "$HEARTBEAT" 2>/dev/null || echo 0) )) -lt 120 ]; then
+    # Plantage tout récent : macOS écrit son rapport quelques secondes après. On lui laisse le temps.
+    sleep 10
+    crash_report && crashed=1
+  fi
+fi
+if [ "$gave_up" = 0 ] && [ -f "$HEARTBEAT" ] && { [ "$frozen" = 1 ] || [ "$crashed" = 1 ]; }; then
+  relaunch && exit 0   # l'app reprend la main : elle réconcilie la veille à son démarrage
+  gave_up=1            # 3 relances en 5 min : boucle de plantage
+fi
+# Abandon : plus de relance automatique jusqu'au prochain lancement de l'app (qui recrée son battement).
+[ "$gave_up" = 1 ] && rm -f "$HEARTBEAT"
+
+[ -f "$MARK" ] || exit 0
+
+if /usr/bin/pmset -g | grep -Eq '^[[:space:]]*SleepDisabled[[:space:]]+1'; then
+  /usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0 && rm -f "$MARK"
+  # Rétablir la veille ne la relance pas écran rabattu : si le capot est fermé et qu'aucun écran externe
+  # n'est branché, on la demande. (AppleClamshellCausesSleep ne suffit pas : il reste à Yes avec un écran externe.)
+  sleep 2
+  if /usr/sbin/ioreg -r -k AppleClamshellState -d 1 | grep -q '"AppleClamshellState" = Yes'; then
+    # Écrans en ligne moins l'écran intégré (sans Python : absent sans les outils Xcode).
+    displays=$(/usr/sbin/system_profiler SPDisplaysDataType 2>/dev/null)
+    online=$(printf '%s\n' "$displays" | grep -c 'Online: Yes')
+    internal=$(printf '%s\n' "$displays" | grep -c 'Connection Type: Internal')
+    if [ -n "$displays" ] && [ $((online - internal)) -le 0 ]; then /usr/bin/pmset sleepnow; fi
+  fi
+else
+  rm -f "$MARK"
+fi
+exit 0
